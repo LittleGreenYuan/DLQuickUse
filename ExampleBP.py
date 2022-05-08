@@ -67,6 +67,7 @@ def train():
     
     for epoch in range(20):#总训练次数
         model.train()
+        loss_all=0
         for batch, (batch_x,batch_y) in enumerate(train_loader):#分批次输入训练样本
             batch_x, batch_y = Variable(batch_x), Variable(batch_y)
             out = model(batch_x)
@@ -75,6 +76,7 @@ def train():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            loss_all=loss_all+loss.item()
         scheduler.step()
         
         model.eval()
@@ -103,3 +105,4 @@ def transformONNX():
 if __name__ == '__main__':
     train()
     transformONNX()
+    #后续可以进行模型读取以及ONXX移植
