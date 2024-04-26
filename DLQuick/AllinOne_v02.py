@@ -10,7 +10,7 @@ import torch.nn.functional as F
 # from datasets import Dataset, load_dataset
 from torch.utils.data import Dataset
 
-train_inputs_ids = torch.randint(0, 10, (200,), dtype=torch.long)
+train_inputs_ids = torch.randint(0, 10, (500,), dtype=torch.long)
 train_outputs_ids = (train_inputs_ids + 3) % 10
 
 
@@ -101,6 +101,7 @@ class TrainingConfig:
         # 初始化训练参数
         self.learning_rate: float = 1e-3
         self.batch_size: int = 8
+        self.gradient_accumulation_steps: int = 4
         self.train_dataloader_shuffle: bool = True
         self.eval_dataloader_shuffle: bool = False
 
@@ -160,6 +161,9 @@ class TrainingConfig:
     def add_global_epoch(self):
         self.global_epoch += 1
 
+    def set_gradient_accumulation_steps(self, gradient_accumulation_steps: int):
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+
     def to_dict(self):
         # 转换为字典，但不包括 device，因为它会在加载时重新计算
         config_dict = {
@@ -180,7 +184,11 @@ class TrainingConfig:
 
     def __str__(self):
         # 提供一个字符串表示，方便打印配置信息
-        return f"TrainingConfig(learning_rate={self.learning_rate}, batch_size={self.batch_size}, epochs={self.epochs}, model_save_path='{self.model_save_dir}, device='({self.device})', train_dataloader_shuffle={self.train_dataloader_shuffle}, eval_dataloader_shuffle={self.eval_dataloader_shuffle}, show_step={self.step_log}), global_step={self.global_step}, global_epoch={self.global_epoch}, save_epochs={self.save_epochs}, random_seed={self.random_seed}"
+        print_text = ''
+        for key, value in self.__dict__.items():
+            print_text += f"{key}: {value}\n"
+        return f"TrainingConfig({print_text})"
+        return f"TrainingConfig(learning_rate={self.learning_rate}, batch_size={self.batch_size}, epochs={self.epochs}, model_save_path='{self.model_save_dir}, device='({self.device})', train_dataloader_shuffle={self.train_dataloader_shuffle}, eval_dataloader_shuffle={self.eval_dataloader_shuffle}, show_step={self.step_log}), global_step={self.global_step}, global_epoch={self.global_epoch}, save_epochs={self.save_epochs}, random_seed={self.random_seed}, gradient_accumulation_steps={self.gradient_accumulation_steps}"
 
 
 config = TrainingConfig()
@@ -208,6 +216,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
 def train(model: nn.Module, config: TrainingConfig, train_dataloader: DataLoader, criterion: nn.modules.loss, optimizer: torch.optim, scheduler: torch.optim.lr_scheduler) -> float:
     model.train()
     total_loss = 0
+    loss_accumulator = 0
     for cur_step, batch in enumerate(train_dataloader):
         step = cur_step + 1
         batch = data_collator(batch)
@@ -217,24 +226,48 @@ def train(model: nn.Module, config: TrainingConfig, train_dataloader: DataLoader
         optimizer.zero_grad()
         output = model(batch["input_ids"])
         loss = criterion(output, batch["labels"])
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        total_loss += loss.item()
 
+        if step % config.gradient_accumulation_steps == 0:
+            loss_accumulator += loss/config.gradient_accumulation_steps
+            # 反向传播
+            loss_accumulator.backward()
+            # 更新参数
+            optimizer.step()
+            # 更新学习率
+            scheduler.step()
+            # 重置损失累加器
+            total_loss += loss_accumulator
+            loss_accumulator = 0
+        else:
+            loss_accumulator += loss/config.gradient_accumulation_steps
+        '''
+        # 反向传播
+        loss.backward()  
+        # 梯度裁剪（如果需要）  
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)  
+        # 更新权重  
+        optimizer.step()  
+        scheduler.step()  
+        # 重置梯度累计器和优化器  
+        optimizer.zero_grad()  
+
+        total_loss += loss
+        '''
         config.add_global_step()
         if config.global_step % config.step_log == 0:
-            print(f"Step {step}: Loss = {loss.item()}")
+            print(f"Step {step}: Loss = {total_loss / step}")
 
     return total_loss / len(train_dataloader)
 
 
 # %% 定义评估函数
-
+from sklearn.metrics import accuracy_score, f1_score, recall_score 
 def evaluate(model: nn.Module, config: TrainingConfig, eval_dataloader: DataLoader, criterion: nn.modules.loss) -> float:
     model.eval()
     total_loss = 0
     with torch.no_grad():
+        labels = []
+        predictions = []
         for cur_step, batch in enumerate(eval_dataloader):
             step = cur_step + 1
             batch = data_collator(batch)
@@ -244,7 +277,18 @@ def evaluate(model: nn.Module, config: TrainingConfig, eval_dataloader: DataLoad
             loss = criterion(output, batch["labels"])
             total_loss += loss.item()
 
-    return total_loss / len(eval_dataloader)
+            labels = labels + batch["labels"].tolist()
+            predictions = predictions + output.argmax(dim=1).tolist()
+
+        accuracy = accuracy_score(labels, predictions)  
+    
+        # 计算F1分数（假设是二分类或多分类问题，可能需要指定average参数）  
+        f1 = f1_score(labels, predictions, average='macro')  # 或者 'macro', 'micro' 等  
+            
+        # 计算召回率  
+        recall = recall_score(labels, predictions, average='macro')  # 或者 'macro', 'micro' 等 
+
+    return total_loss / len(eval_dataloader), accuracy, f1, recall
 
 # %% 定义保存模型和配置的函数
 
