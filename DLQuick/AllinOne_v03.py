@@ -1,11 +1,12 @@
 import json
 import os
+import random
 from torch.utils.data import DataLoader
 from transformers import Trainer, TrainingArguments
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from tqdm import tqdm 
 # %% 定义数据集
 # from datasets import Dataset, load_dataset
 from torch.utils.data import Dataset
@@ -14,7 +15,7 @@ train_inputs_ids = torch.randint(0, 10, (500,), dtype=torch.long)
 train_outputs_ids = (train_inputs_ids + 3) % 10
 
 
-eval_inputs_ids = torch.randint(0, 10, (100,), dtype=torch.long)
+eval_inputs_ids = torch.randint(0, 10, (1000,), dtype=torch.long)
 eval_outputs_ids = (eval_inputs_ids + 3) % 10
 
 
@@ -114,15 +115,22 @@ class TrainingConfig:
         self.global_step: int = 0
         self.global_epoch: int = 0
         self.save_epochs: int = 5
+        self.save_step: int = 50
+
+        # self.resume_from_checkpoint = r'D://code//python//outputtest//checkpoint_150//'
+        self.resume_from_checkpoint = None
 
         # self.random_seed = torch.get_rng_state()
         self.random_seed: int = 233
+
+        self.best_eval_indicator: float = float('-inf')
 
         # 使用 kwargs 来覆盖默认值（如果存在的话）
         for key, value in kwargs.items():
             setattr(self, key, value)
         
         torch.manual_seed(self.random_seed)
+        random.seed(self.random_seed)
 
     def set_learning_rate(self, lr: float):
         self.learning_rate = lr
@@ -154,6 +162,7 @@ class TrainingConfig:
     def set_random_seed(self, seed: int):
         self.random_seed = seed
         torch.manual_seed(self.random_seed)
+        random.seed(self.random_seed)
 
     def add_global_step(self):
         self.global_step += 1
@@ -163,6 +172,12 @@ class TrainingConfig:
 
     def set_gradient_accumulation_steps(self, gradient_accumulation_steps: int):
         self.gradient_accumulation_steps = gradient_accumulation_steps
+    
+    def set_save_step(self, save_step: int):
+        self.save_step = save_step
+    
+    def set_best_eval_indicator(self, best_eval_indicator: float):
+        self.best_eval_indicator = best_eval_indicator
 
     def to_dict(self):
         # 转换为字典，但不包括 device，因为它会在加载时重新计算
@@ -170,16 +185,6 @@ class TrainingConfig:
             key: getattr(self, key)
             for key in vars(self).keys() if key != 'device'
         }
-        '''     
-        config_dict = {  
-            key: getattr(self, key) 
-            for key in [  
-                'learning_rate', 'batch_size', 'train_dataloader_shuffle',  
-                'eval_dataloader_shuffle', 'epochs', 'model_save_dir',  
-                'step_log', 'global_step', 'global_epoch', 'save_epochs'  
-            ]  
-        }
-        '''
         return config_dict
 
     def __str__(self):
@@ -188,7 +193,6 @@ class TrainingConfig:
         for key, value in self.__dict__.items():
             print_text += f"{key}: {value}\n"
         return f"TrainingConfig({print_text})"
-        return f"TrainingConfig(learning_rate={self.learning_rate}, batch_size={self.batch_size}, epochs={self.epochs}, model_save_path='{self.model_save_dir}, device='({self.device})', train_dataloader_shuffle={self.train_dataloader_shuffle}, eval_dataloader_shuffle={self.eval_dataloader_shuffle}, show_step={self.step_log}), global_step={self.global_step}, global_epoch={self.global_epoch}, save_epochs={self.save_epochs}, random_seed={self.random_seed}, gradient_accumulation_steps={self.gradient_accumulation_steps}"
 
 
 config = TrainingConfig()
@@ -205,20 +209,116 @@ train_dataloader = DataLoader(
 eval_dataloader = DataLoader(
     eval_dataset, batch_size=config.batch_size, shuffle=config.train_dataloader_shuffle)
 
+
 # %% 定义损失函数和优化器
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
 
-# %% 定义训练函数
+# %% 接续训练
+global resume_from_checkpoint_flag
+# resume_from_checkpoint = None
+if config.resume_from_checkpoint is not None:
+    # 读取本地模型和配置
+    resume_from_checkpoint = config.resume_from_checkpoint
+    save_dict_resume = torch.load(os.path.join(resume_from_checkpoint, "model.pth"))
+    config = TrainingConfig(**save_dict_resume['config'])
+    print(config)
+    model.load_state_dict(save_dict_resume["model"])
+    model.to(config.device)
+    optimizer.load_state_dict(save_dict_resume["optimizer"])
+    scheduler.load_state_dict(save_dict_resume["scheduler"])
+    
+    resume_from_checkpoint_flag = True
+    start_epoch = config.global_epoch
+    # 设置 tqdm 的初始值  
+    initial = config.global_step if config.global_step is not None else 0  
+    # pbar = tqdm(total=config.epochs*len(train_dataloader) - initial, initial=initial, desc='Training')
+    pbar = tqdm(total=config.epochs*len(train_dataloader), initial=initial, desc='Training')
+else:
+    resume_from_checkpoint_flag = False
+    start_epoch = config.global_epoch
+    # 设置 tqdm 的初始值  
+    initial = config.global_step if config.global_step is not None else 0  
+    # pbar = tqdm(total=config.epochs*len(train_dataloader) - initial, initial=initial, desc='Training') 
+    pbar = tqdm(total=config.epochs*len(train_dataloader), initial=initial, desc='Training') 
+  
 
-def train(model: nn.Module, config: TrainingConfig, train_dataloader: DataLoader, criterion: nn.modules.loss, optimizer: torch.optim, scheduler: torch.optim.lr_scheduler) -> float:
+
+
+# %%保存模型与配置文件的独立函数
+def save_dict_and_config(save_dict: dict, config_dict: dict, checkpoint_dir: str, checkpoint_file: str):
+    if(type(config_dict) == TrainingConfig):
+        config_dict = config_dict.to_dict()
+
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+
+    # 保存模型
+    torch.save(save_dict, os.path.join(checkpoint_dir, checkpoint_file))
+    print("\nModel saved.")
+    # 保存配置文件
+    with open(os.path.join(checkpoint_dir, "config.json"), "w") as f:
+        json.dump(config_dict, f)
+        print("\nconfig saved.")
+        print("--------------------------------------------------------------------")
+
+
+# %% 定义训练过程中的保存函数
+def save_model_intrain(model: nn.Module, config: TrainingConfig, optimizer: torch.optim, scheduler: torch.optim.lr_scheduler) -> None:
+    steps = config.global_step
+    model_save_dir = config.model_save_dir
+    checkpoint_dir = os.path.join(model_save_dir, f'checkpoint_{steps}/')  
+    checkpoint_file = f'model.pth'
+
+    # 确保checkpoint目录存在  
+    if not os.path.exists(checkpoint_dir):  
+        os.makedirs(checkpoint_dir)
+    # 获取model_save目录下所有文件夹  
+    checkpoint_dirs = [d for d in os.listdir(model_save_dir) if os.path.isdir(os.path.join(model_save_dir, d))]  
+      
+    # 过滤出与checkpoint相关的文件夹，并按名称排序（这将基于steps的值）  
+    checkpoint_dirs = sorted([d for d in checkpoint_dirs if d.startswith('checkpoint_')], key=lambda x: int(x.split('_')[1]))  
+  
+    # 如果文件夹数量超过3个，删除最老的checkpoint  
+    if len(checkpoint_dirs) > 3:  
+        oldest_dir = os.path.join(model_save_dir, checkpoint_dirs[0])  
+        for file in os.listdir(oldest_dir):  
+            file_path = os.path.join(oldest_dir, file)  
+            if os.path.isfile(file_path):  
+                os.unlink(file_path)  
+        os.rmdir(oldest_dir)
+    
+    save_dict = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "config": config.__dict__,
+            "golbal_step": config.global_step,
+            "global_epoch": config.global_epoch,
+            "train_loss": None,
+            "eval_loss": None,
+        }
+    
+    #保存当前step对应的模型文件
+    #保存模型
+    save_dict_and_config(save_dict = save_dict, config_dict = config.to_dict(), checkpoint_dir = checkpoint_dir, checkpoint_file = checkpoint_file)
+# %% 定义训练函数
+import time
+def train(model: nn.Module, config: TrainingConfig, train_dataloader: DataLoader, criterion: nn.modules.loss, optimizer: torch.optim, scheduler: torch.optim.lr_scheduler, pbar: tqdm) -> float:
     model.train()
     total_loss = 0
     loss_accumulator = 0
+    global resume_from_checkpoint_flag
     for cur_step, batch in enumerate(train_dataloader):
         step = cur_step + 1
+        if resume_from_checkpoint_flag:
+            if step < (config.global_step % len(train_dataloader)):
+                continue
+            else:
+                resume_from_checkpoint_flag = False
+
         batch = data_collator(batch)
         batch = {k: v.to(config.device) for k, v in batch.items()}
 
@@ -240,22 +340,15 @@ def train(model: nn.Module, config: TrainingConfig, train_dataloader: DataLoader
             loss_accumulator = 0
         else:
             loss_accumulator += loss/config.gradient_accumulation_steps
-        '''
-        # 反向传播
-        loss.backward()  
-        # 梯度裁剪（如果需要）  
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)  
-        # 更新权重  
-        optimizer.step()  
-        scheduler.step()  
-        # 重置梯度累计器和优化器  
-        optimizer.zero_grad()  
-
-        total_loss += loss
-        '''
+        
         config.add_global_step()
+        pbar.update()
         if config.global_step % config.step_log == 0:
-            print(f"Step {step}: Loss = {total_loss / step}")
+            # print(f"Step {step}: Loss = {total_loss / step}")
+            print(f"Step {step}: Global Step{config.global_step}: Loss = {loss}")
+        
+        if config.global_step % config.save_step == 0:
+            save_model_intrain(model, config, optimizer, scheduler)
 
     return total_loss / len(train_dataloader)
 
@@ -286,55 +379,76 @@ def evaluate(model: nn.Module, config: TrainingConfig, eval_dataloader: DataLoad
         f1 = f1_score(labels, predictions, average='macro')  # 或者 'macro', 'micro' 等  
             
         # 计算召回率  
-        recall = recall_score(labels, predictions, average='macro')  # 或者 'macro', 'micro' 等 
+        recall = recall_score(labels, predictions, average='macro')  # 或者 'macro', 'micro' 等
 
-    return total_loss / len(eval_dataloader), accuracy, f1, recall
+        if accuracy > config.best_eval_indicator:
+            print("New best model found!!!!")
+            best_save_dict = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "config": config.__dict__,
+                "golbal_step": config.global_step,
+                "global_epoch": config.global_epoch,
+                "train_loss": None,
+                "eval_loss": total_loss / len(eval_dataloader),
+            }
+            best_config = config.to_dict()
+            config.set_best_eval_indicator(accuracy)
+            model_save_dir = config.model_save_dir
+            best_dir = os.path.join(model_save_dir, f'best_model/')  
+            best_file = f'best_model.pth'
+            save_dict_and_config(save_dict = best_save_dict, config_dict = best_config, checkpoint_dir = best_dir, checkpoint_file = best_file)
+
+        
+        eval_indicator = {
+            'loss':total_loss / len(eval_dataloader),
+            'accuracy': accuracy,
+            'f1': f1,
+            'recall': recall,
+            }
+
+
+    return eval_indicator
 
 # %% 定义保存模型和配置的函数
 
-def save_model(model: nn.Module, config: TrainingConfig, optimizer: torch.optim, scheduler: torch.optim.lr_scheduler, train_loss: float, eval_loss: float) -> None:
-    if config.global_epoch % config.save_epochs == 0:
-        save_dict = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "config": config.__dict__,
-            "train_loss": train_loss,
-            "eval_loss": eval_loss
-        }
-        torch.save(save_dict, os.path.join(config.model_save_dir, "model.pth"))
-        print("\nModel saved.")
-        # 保存训练配置
-        # config_dict = config.__dict__.copy()
-        # # 删除 device 属性（假设它存在）
-        # if 'device' in config_dict:
-        #     del config_dict['device']
-        with open(os.path.join(config.model_save_dir, "config.json"), "w") as f:
-            json.dump(config.to_dict(), f)
-            print("\nconfig saved.")
-            print("--------------------------------------------------------------------")
+def save_model_inepoch(model: nn.Module, config: TrainingConfig, optimizer: torch.optim, scheduler: torch.optim.lr_scheduler, train_loss: float, eval_loss: float) -> None:
+    save_dict = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "config": config.__dict__,
+        "train_loss": train_loss,
+        "eval_loss": eval_loss
+    }
+
+    save_dict_and_config(save_dict = save_dict, config_dict = config.to_dict(), checkpoint_dir = config.model_save_dir, checkpoint_file = "model.pth")
+
+        
 
 
 # %% 训练模型
 
 model.to(config.device)
-for epoch in range(config.epochs):
-    print(f"Epoch {epoch+1}:")
+for epoch in range(start_epoch, config.epochs):
+    print(f"Epoch {epoch}:")
     train_loss = train(model, config, train_dataloader,
-                       criterion, optimizer, scheduler)
+                       criterion, optimizer, scheduler, pbar)
     print(f"Train Loss: {train_loss}")
-    eval_loss = evaluate(model, config, eval_dataloader, criterion)
-    print(f"Eval Loss: {eval_loss}")
+    eval_indicator = evaluate(model, config, eval_dataloader, criterion)
+    print(f"Eval Loss: {eval_indicator}")
 
+    if config.global_epoch % config.save_epochs == 0:
+        save_model_inepoch(model, config, optimizer, scheduler, train_loss, eval_indicator['loss'])
     config.add_global_epoch()
-
-    save_model(model, config, optimizer, scheduler, train_loss, eval_loss)
 
 # %% 加载模型和配置
 
 # 读取本地模型和配置
 save_dict = torch.load(os.path.join(config.model_save_dir, "model.pth"))
-config = TrainingConfig(**save_dict["config"])
+config_new = TrainingConfig(**save_dict["config"])
+print(config_new)
 model.load_state_dict(save_dict["model"])
 optimizer.load_state_dict(save_dict["optimizer"])
 scheduler.load_state_dict(save_dict["scheduler"])
