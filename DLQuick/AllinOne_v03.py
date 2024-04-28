@@ -442,6 +442,8 @@ for epoch in range(start_epoch, config.epochs):
     if config.global_epoch % config.save_epochs == 0:
         save_model_inepoch(model, config, optimizer, scheduler, train_loss, eval_indicator['loss'])
     config.add_global_epoch()
+    config.set_random_seed(config.random_seed + 1)
+save_model_inepoch(model, config, optimizer, scheduler, train_loss, eval_indicator['loss'])
 
 # %% 加载模型和配置
 
