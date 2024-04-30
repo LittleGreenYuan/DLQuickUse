@@ -21,7 +21,6 @@ train_outputs_ids = (train_inputs_ids + 3) % 10
 eval_inputs_ids = torch.randint(0, 10, (1000,), dtype=torch.long)
 eval_outputs_ids = (eval_inputs_ids + 3) % 10
 
-
 class MyDataset(Dataset):
     def __init__(self, inputs_ids, outputs_ids):
         self.inputs_ids = inputs_ids
